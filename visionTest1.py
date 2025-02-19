@@ -358,7 +358,7 @@ async def main():
 
 asyncio.run(main())
 '''
-
+'''
 import struct
 import asyncio
 import aioble
@@ -434,6 +434,113 @@ async def peripheral_task():
             # Wait until the central disconnects
             await connection.disconnected()
             print("❌ Disconnected! Restarting advertisement...")
+            # Cancel background tasks upon disconnect
+            ka_task.cancel()
+            det_task.cancel()
+            try:
+                await ka_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await det_task
+            except asyncio.CancelledError:
+                pass
+
+async def main():
+    await peripheral_task()
+
+asyncio.run(main())
+'''
+import struct
+import asyncio
+import aioble
+import bluetooth
+import sensor
+import image
+import pyb  # For LED control
+from micropython import const
+
+# Custom 128-bit UUIDs (match these with your Arduino)
+SERVICE_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef0")
+CHAR_UUID    = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef1")
+
+# Lower advertisement interval for quicker discovery (in microseconds)
+_ADV_INTERVAL_US = const(40_000)  # ~40ms
+
+# Set up the BLE GATT service and characteristic
+my_service = aioble.Service(SERVICE_UUID)
+my_characteristic = aioble.Characteristic(
+    my_service,
+    CHAR_UUID,
+    read=True,    # Characteristic can be read
+    notify=True   # Characteristic supports notifications
+)
+aioble.register_services(my_service)
+
+# Initialize the camera
+sensor.reset()
+sensor.set_pixformat(sensor.RGB565)
+sensor.set_framesize(sensor.QVGA)
+sensor.skip_frames(time=2000)
+
+# Initialize LEDs for visual feedback
+red_led = pyb.LED(1)
+green_led = pyb.LED(2)
+
+# Yellow detection threshold (adjust as needed)
+YELLOW_THRESHOLD = (28, 96, -128, 26, 26, 114)
+
+async def keep_alive_task():
+    """Send a keep-alive notification every 1 second."""
+    while True:
+        # 2 = keep-alive signal
+        # IMPORTANT: send_update=True actually sends the BLE notification
+        my_characteristic.write(struct.pack("<B", 2), send_update=True)
+        print("📤 Sent keep-alive notification (2).")
+        await asyncio.sleep(1)
+
+async def detect_yellow_task():
+    """Capture an image, detect yellow, and send 1 or 0 via notification."""
+    while True:
+        img = sensor.snapshot()
+        await asyncio.sleep_ms(10)  # Yield to BLE tasks
+        blobs = img.find_blobs([YELLOW_THRESHOLD], merge=True)
+        await asyncio.sleep_ms(10)  # Yield again
+
+        if blobs:
+            red_led.off()
+            green_led.on()
+            # 1 = yellow detected
+            my_characteristic.write(struct.pack("<B", 1), send_update=True)
+            print("Yellow Detected: Sent 1")
+        else:
+            red_led.on()
+            green_led.off()
+            # 0 = no yellow
+            my_characteristic.write(struct.pack("<B", 0), send_update=True)
+            print("No Yellow: Sent 0")
+
+        await asyncio.sleep(2)
+
+async def peripheral_task():
+    while True:
+        print("🔵 Advertising OpenMV BLE...")
+        # Advertise until connected
+        async with await aioble.advertise(
+            _ADV_INTERVAL_US,
+            name="OpenMV_BLE",
+            services=[SERVICE_UUID]
+        ) as connection:
+            print("🔗 Connected to Central!")
+
+            # Launch both tasks concurrently
+            ka_task = asyncio.create_task(keep_alive_task())
+            det_task = asyncio.create_task(detect_yellow_task())
+
+            # Wait until the central disconnects
+            await connection.disconnected()
+            print("❌ Disconnected! Restarting advertisement...")
+
             # Cancel background tasks upon disconnect
             ka_task.cancel()
             det_task.cancel()
